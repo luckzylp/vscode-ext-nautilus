@@ -1,0 +1,5 @@
+.cache
+.omc
+.claude
+compile_commands.json
+*.c.*
