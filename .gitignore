@@ -3,3 +3,4 @@
 .claude
 compile_commands.json
 *.c.*
+vscode_nautilus_extension.so
