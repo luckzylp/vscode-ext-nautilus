@@ -15,7 +15,7 @@
  * @date 2026-05-26
  */
 
-#include <unistd.h>
+#include <string.h>
 
 #include <gio/gio.h>
 #include <glib-object.h>
@@ -107,7 +107,7 @@ static void free_file_list(gpointer data, GClosure *closure) {
  * 1. Extracts file URIs from the NautilusFileInfo objects
  * 2. Converts URIs to local file paths
  * 3. Constructs an argument vector for g_spawn_async()
- * 4. Launches /usr/bin/code with all file paths as arguments
+ * 4. Launches the `code` CLI (resolved from PATH) with all file paths as arguments
  *
  * The spawned process runs asynchronously with stdout/stderr redirected to /dev/null
  * to prevent any terminal output from interfering with the file manager.
@@ -123,9 +123,10 @@ static void open_with_vscode(NautilusMenuItem *item, gpointer user_data) {
   // GPtrArray automatically grows as we add elements
   GPtrArray *argv = g_ptr_array_new();
 
-  // First argument: path to the VSCode executable
-  // g_strdup() creates a copy that we own (will be freed by g_ptr_array)
-  g_ptr_array_add(argv, g_strdup("/usr/bin/code"));
+  // First argument: the VSCode CLI, resolved from PATH via
+  // G_SPAWN_SEARCH_PATH (works for deb's /usr/bin/code, snap's
+  // /snap/bin/code, and other packaged installs alike)
+  g_ptr_array_add(argv, g_strdup("code"));
 
   // Iterate through all selected files and add their paths as arguments
   for (GList *l = selected; l; l = l->next) {
@@ -186,129 +187,90 @@ static void open_with_vscode(NautilusMenuItem *item, gpointer user_data) {
 }
 
 /**
- * @brief Checks whether a desktop entry's Exec line launches the `code` CLI.
+ * @brief Case-insensitive whole-word substring search on a lowercased string.
  *
- * The desktop file name is not stable across installation channels
- * (code.desktop, code_code.desktop, visual-studio-code.desktop, ...), so
- * detection is based on the Exec line instead: the first token that is not
- * `env` or a VAR=VALUE assignment must be the `code` executable. Entries
- * that launch something else (e.g. Code::Blocks' codeblocks, or
- * `flatpak run com.visualstudio.code`) are rejected, because activating the
- * menu item spawns `code` and would fail for them.
+ * Used instead of plain strstr() so that apps whose id or name merely
+ * contains "code"/"vscode" as part of another word (e.g. Code::Blocks'
+ * "codeblocks", "codecutter") are not misidentified. Word boundaries are
+ * the string edges or any non-alphanumeric character (".", "-", "_",
+ * space), so ids like "com.microsoft.vscode.desktop", "code_code.desktop"
+ * and names like "Visual Studio Code" match.
  *
- * @param exec The raw Exec= value from a desktop entry
- * @return TRUE if the command's program is `code`
+ * @param haystack Lowercased string to search (may be NULL)
+ * @param needle   Lowercased word to find
+ * @return TRUE if needle occurs as a whole word
  */
-static gboolean exec_launches_code(const char *exec) {
-  gchar **argv = NULL;
-  if (!g_shell_parse_argv(exec, NULL, &argv, NULL))
+static gboolean contains_word(const char *haystack, const char *needle) {
+  if (!haystack)
     return FALSE;
 
-  gboolean launches = FALSE;
-  for (int i = 0; argv[i] && !launches; i++) {
-    // Skip "env" and environment assignments before the actual program
-    if (strcmp(argv[i], "env") == 0 || strchr(argv[i], '='))
-      continue;
-
-    gchar *base = g_path_get_basename(argv[i]);
-    launches = strcmp(base, "code") == 0;
-    g_free(base);
-    // The first non-environment token is the program; nothing after it counts
-    break;
+  size_t needle_len = strlen(needle);
+  for (const char *p = haystack; (p = strstr(p, needle)) != NULL; p++) {
+    gboolean before_ok = (p == haystack) || !g_ascii_isalnum(p[-1]);
+    gboolean after_ok =
+        (p[needle_len] == '\0') || !g_ascii_isalnum(p[needle_len]);
+    if (before_ok && after_ok)
+      return TRUE;
   }
-
-  g_strfreev(argv);
-  return launches;
+  return FALSE;
 }
 
 /**
- * @brief Checks whether a desktop entry for the `code` CLI is installed.
+ * @brief Checks whether VSCode is installed, via the desktop application
+ * database (GAppInfo).
  *
- * VSCode's packaging registers a desktop entry with the desktop environment
- * on install and removes it on uninstall, so its presence is a reliable
- * signal that VSCode is installed — regardless of the file's actual name.
+ * VSCode's packaging registers a desktop entry on install and removes it on
+ * uninstall, regardless of the entry's actual file name (the official deb
+ * ships com.microsoft.VSCode.desktop, snap uses code_code.desktop, ...).
+ * Discovery therefore matches whole words "code"/"vscode" in the app id or
+ * display name instead of hard-coded file names.
  *
- * Scans the XDG applications dirs (user first, then system) for *.desktop
- * files whose name contains "code" and checks whether they launch `code`.
+ * GLib guarantees two things for free for entries returned by
+ * g_app_info_get_all(): the Exec= executable exists (so a desktop file
+ * lingering after a manual uninstall is filtered out), and standard XDG
+ * lookup semantics apply.
  *
- * @return TRUE if such a desktop entry is found
- */
-static gboolean vscode_desktop_file_exists(void) {
-  GPtrArray *dirs = g_ptr_array_new_with_free_func(g_free);
-  g_ptr_array_add(dirs, g_build_filename(g_get_user_data_dir(), "applications",
-                                         NULL));
-  for (const gchar *const *dir = g_get_system_data_dirs(); *dir; dir++)
-    g_ptr_array_add(dirs, g_build_filename(*dir, "applications", NULL));
-
-  gboolean found = FALSE;
-  for (guint d = 0; d < dirs->len && !found; d++) {
-    GDir *gdir = g_dir_open(dirs->pdata[d], 0, NULL);
-    if (!gdir)
-      continue;
-
-    const char *name;
-    while (!found && (name = g_dir_read_name(gdir)) != NULL) {
-      if (!g_str_has_suffix(name, ".desktop"))
-        continue;
-
-      gchar *lower = g_ascii_strdown(name, -1);
-      gboolean candidate = strstr(lower, "code") != NULL;
-      g_free(lower);
-      if (!candidate)
-        continue;
-
-      gchar *path =
-          g_build_filename(dirs->pdata[d], name, NULL);
-      GKeyFile *kf = g_key_file_new();
-      if (g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL)) {
-        gchar *exec =
-            g_key_file_get_string(kf, "Desktop Entry", "Exec", NULL);
-        if (exec) {
-          found = exec_launches_code(exec);
-          g_free(exec);
-        }
-      }
-      g_key_file_free(kf);
-      g_free(path);
-    }
-
-    g_dir_close(gdir);
-  }
-
-  g_ptr_array_free(dirs, TRUE);
-  return found;
-}
-
-/**
- * @brief Checks whether VSCode is actually installed.
+ * Flatpak entries (Exec=flatpak run com.visualstudio.code) are excluded
+ * because the menu launches the `code` CLI directly.
  *
- * The menu item must not appear when VSCode has been uninstalled from the
- * system: this extension is a separate package and is not removed by
- * VSCode's own uninstaller. Checked on every menu build (a directory scan
- * plus a few file reads) so the menu reappears/disappears without
+ * Checked on every menu build so the menu appears/disappears without
  * restarting Nautilus.
  *
- * Recognized signals (any one is enough):
- * 1. A desktop entry launching the `code` CLI in an XDG applications dir
- * 2. The hard-coded launcher /usr/bin/code
- * 3. A `code` executable on PATH (via g_find_program_in_path)
- *
- * @return TRUE if a VSCode installation can be found, FALSE otherwise
+ * @return TRUE if a VSCode desktop entry is found, FALSE otherwise
  */
 static gboolean vscode_installed(void) {
-  if (vscode_desktop_file_exists())
-    return TRUE;
+  GList *apps = g_app_info_get_all();
+  gboolean found = FALSE;
 
-  if (access("/usr/bin/code", X_OK) == 0)
-    return TRUE;
+  for (GList *l = apps; l && !found; l = l->next) {
+    GAppInfo *app = G_APP_INFO(l->data);
+    const char *id = g_app_info_get_id(app);
+    const char *name = g_app_info_get_name(app);
 
-  char *path = g_find_program_in_path("code");
-  if (path) {
-    g_free(path);
-    return TRUE;
+    gchar *id_lower = id ? g_utf8_strdown(id, -1) : NULL;
+    gchar *name_lower = name ? g_utf8_strdown(name, -1) : NULL;
+
+    gboolean is_vscode = contains_word(id_lower, "code") ||
+                         contains_word(id_lower, "vscode") ||
+                         contains_word(name_lower, "code") ||
+                         contains_word(name_lower, "vscode");
+
+    g_free(id_lower);
+    g_free(name_lower);
+
+    if (!is_vscode)
+      continue;
+
+    const char *exe = g_app_info_get_executable(app);
+    gchar *base = exe ? g_path_get_basename(exe) : NULL;
+    gboolean is_flatpak = base && strcmp(base, "flatpak") == 0;
+    g_free(base);
+
+    found = !is_flatpak;
   }
 
-  return FALSE;
+  g_list_free_full(apps, g_object_unref);
+  return found;
 }
 
 /**

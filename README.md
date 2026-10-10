@@ -23,9 +23,9 @@ that plugs directly into Nautilus' extension system
 ## Features
 
 - **"Open with VSCode" context-menu entry** for files and folders
-- **Auto-hides when VSCode is uninstalled** — the entry checks on every menu
-  build that VSCode is still installed and stays hidden otherwise, without
-  restarting Nautilus
+- **Auto-hides when VSCode is uninstalled** — discovery goes through the
+  desktop application database (`GAppInfo`) on every menu build, so the
+  entry tracks the actual installation state without restarting Nautilus
 - **Multi-selection support** — every selected path is passed to VSCode at once
 - **Fire-and-forget launch** — spawns `code` asynchronously with stdout/stderr
   redirected to `/dev/null`, so the file manager stays clean
@@ -40,7 +40,7 @@ that plugs directly into Nautilus' extension system
 | `libnautilus-extension-dev` | Nautilus extension API |
 | `libglib2.0-dev`, `libgtk-3-dev` | GObject / GTK headers |
 | `gcc` + `make` + `pkg-config` | Build toolchain |
-| Visual Studio Code | The editor to launch (`code` reachable on `PATH`, or at `/usr/bin/code`) |
+| Visual Studio Code | The editor to launch (a desktop entry registered by its installer, e.g. the official deb; `code` reachable on `PATH`) |
 
 ## Build & Install
 
@@ -66,19 +66,20 @@ window — a new one by default, since the extension spawns `code` without the
 
 ## How It Works
 
-1. Whenever a context menu is requested, the extension checks that VSCode is
-   still installed — by scanning the XDG applications dirs for a desktop
-   entry that launches the `code` CLI (whatever the file is named; the
-   official deb ships `com.microsoft.VSCode.desktop`, snap uses
-   `code_code.desktop`), plus the hard-coded launcher `/usr/bin/code` and a
-   `code` executable on `PATH`. If none is found (e.g. VSCode was
-   uninstalled), no menu item is created.
+1. Whenever a context menu is requested, the extension queries the desktop
+   application database (`g_app_info_get_all()`) for a VSCode entry —
+   matched by whole word "code"/"vscode" in the app id or display name,
+   whatever the desktop file is named (the official deb ships
+   `com.microsoft.VSCode.desktop`, snap uses `code_code.desktop`).
+   GLib already drops entries whose `Exec=` binary is missing, so a desktop
+   file lingering after an uninstall is filtered out; flatpak entries are
+   excluded. If no entry is found, no menu item is created.
 2. Otherwise it creates a single `NautilusMenuItem` labelled
    "Open with VSCode" (`vscode::open`).
 3. On activation, each `NautilusFileInfo` URI is converted to a local
    filesystem path with `g_filename_from_uri()`; items that cannot be
    converted (e.g. remote shares) are skipped.
-4. The argument vector `/usr/bin/code <path1> <path2> ...` is launched
+4. The argument vector `code <path1> <path2> ...` is launched
    via `g_spawn_async()` with `G_SPAWN_SEARCH_PATH`, so the `code` binary is
    also resolved from `PATH`. stdout/stderr are redirected to `/dev/null` to
    keep Nautilus free of terminal output.
@@ -119,9 +120,10 @@ versions with the legacy `extensions-3.0` directory are not supported.
 
 ## Known Limitations
 
-- The launcher path is hard-coded to `/usr/bin/code` (with a `PATH` fallback
-  via `G_SPAWN_SEARCH_PATH`). Snap (`/snap/bin/code`) and Flatpak
-  (`flatpak run com.visualstudio.code`) installations are not detected.
+- Discovery requires a desktop entry: any packaged install (deb, rpm, snap)
+  registers one, but a `code` binary manually placed on `PATH` without a
+  desktop entry is not detected. Flatpak installs are not supported because
+  launching goes through the `code` CLI (`flatpak run` entries are excluded).
 - Non-local selections (remote mounts, etc.) cannot be converted to local
   paths and are silently skipped.
 - Launching is fire-and-forget: VSCode starts in the background without a
