@@ -68,9 +68,11 @@ window — a new one by default, since the extension spawns `code` without the
 
 1. Whenever a context menu is requested, the extension checks that VSCode is
    still installed — by scanning the XDG applications dirs for a desktop
-   entry that launches the `code` CLI (whatever the file is named), plus the
-   hard-coded launcher `/usr/bin/code` and a `code` executable on `PATH`.
-   If none is found (e.g. VSCode was uninstalled), no menu item is created.
+   entry that launches the `code` CLI (whatever the file is named; the
+   official deb ships `com.microsoft.VSCode.desktop`, snap uses
+   `code_code.desktop`), plus the hard-coded launcher `/usr/bin/code` and a
+   `code` executable on `PATH`. If none is found (e.g. VSCode was
+   uninstalled), no menu item is created.
 2. Otherwise it creates a single `NautilusMenuItem` labelled
    "Open with VSCode" (`vscode::open`).
 3. On activation, each `NautilusFileInfo` URI is converted to a local
