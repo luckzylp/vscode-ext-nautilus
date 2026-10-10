@@ -15,6 +15,8 @@
  * @date 2026-05-26
  */
 
+#include <unistd.h>
+
 #include <gio/gio.h>
 #include <glib-object.h>
 #include <nautilus-extension.h>
@@ -184,21 +186,153 @@ static void open_with_vscode(NautilusMenuItem *item, gpointer user_data) {
 }
 
 /**
+ * @brief Checks whether a desktop entry's Exec line launches the `code` CLI.
+ *
+ * The desktop file name is not stable across installation channels
+ * (code.desktop, code_code.desktop, visual-studio-code.desktop, ...), so
+ * detection is based on the Exec line instead: the first token that is not
+ * `env` or a VAR=VALUE assignment must be the `code` executable. Entries
+ * that launch something else (e.g. Code::Blocks' codeblocks, or
+ * `flatpak run com.visualstudio.code`) are rejected, because activating the
+ * menu item spawns `code` and would fail for them.
+ *
+ * @param exec The raw Exec= value from a desktop entry
+ * @return TRUE if the command's program is `code`
+ */
+static gboolean exec_launches_code(const char *exec) {
+  gchar **argv = NULL;
+  if (!g_shell_parse_argv(exec, NULL, &argv, NULL))
+    return FALSE;
+
+  gboolean launches = FALSE;
+  for (int i = 0; argv[i] && !launches; i++) {
+    // Skip "env" and environment assignments before the actual program
+    if (strcmp(argv[i], "env") == 0 || strchr(argv[i], '='))
+      continue;
+
+    gchar *base = g_path_get_basename(argv[i]);
+    launches = strcmp(base, "code") == 0;
+    g_free(base);
+    // The first non-environment token is the program; nothing after it counts
+    break;
+  }
+
+  g_strfreev(argv);
+  return launches;
+}
+
+/**
+ * @brief Checks whether a desktop entry for the `code` CLI is installed.
+ *
+ * VSCode's packaging registers a desktop entry with the desktop environment
+ * on install and removes it on uninstall, so its presence is a reliable
+ * signal that VSCode is installed — regardless of the file's actual name.
+ *
+ * Scans the XDG applications dirs (user first, then system) for *.desktop
+ * files whose name contains "code" and checks whether they launch `code`.
+ *
+ * @return TRUE if such a desktop entry is found
+ */
+static gboolean vscode_desktop_file_exists(void) {
+  GPtrArray *dirs = g_ptr_array_new_with_free_func(g_free);
+  g_ptr_array_add(dirs, g_build_filename(g_get_user_data_dir(), "applications",
+                                         NULL));
+  for (const gchar *const *dir = g_get_system_data_dirs(); *dir; dir++)
+    g_ptr_array_add(dirs, g_build_filename(*dir, "applications", NULL));
+
+  gboolean found = FALSE;
+  for (guint d = 0; d < dirs->len && !found; d++) {
+    GDir *gdir = g_dir_open(dirs->pdata[d], 0, NULL);
+    if (!gdir)
+      continue;
+
+    const char *name;
+    while (!found && (name = g_dir_read_name(gdir)) != NULL) {
+      if (!g_str_has_suffix(name, ".desktop"))
+        continue;
+
+      gchar *lower = g_ascii_strdown(name, -1);
+      gboolean candidate = strstr(lower, "code") != NULL;
+      g_free(lower);
+      if (!candidate)
+        continue;
+
+      gchar *path =
+          g_build_filename(dirs->pdata[d], name, NULL);
+      GKeyFile *kf = g_key_file_new();
+      if (g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL)) {
+        gchar *exec =
+            g_key_file_get_string(kf, "Desktop Entry", "Exec", NULL);
+        if (exec) {
+          found = exec_launches_code(exec);
+          g_free(exec);
+        }
+      }
+      g_key_file_free(kf);
+      g_free(path);
+    }
+
+    g_dir_close(gdir);
+  }
+
+  g_ptr_array_free(dirs, TRUE);
+  return found;
+}
+
+/**
+ * @brief Checks whether VSCode is actually installed.
+ *
+ * The menu item must not appear when VSCode has been uninstalled from the
+ * system: this extension is a separate package and is not removed by
+ * VSCode's own uninstaller. Checked on every menu build (a directory scan
+ * plus a few file reads) so the menu reappears/disappears without
+ * restarting Nautilus.
+ *
+ * Recognized signals (any one is enough):
+ * 1. A desktop entry launching the `code` CLI in an XDG applications dir
+ * 2. The hard-coded launcher /usr/bin/code
+ * 3. A `code` executable on PATH (via g_find_program_in_path)
+ *
+ * @return TRUE if a VSCode installation can be found, FALSE otherwise
+ */
+static gboolean vscode_installed(void) {
+  if (vscode_desktop_file_exists())
+    return TRUE;
+
+  if (access("/usr/bin/code", X_OK) == 0)
+    return TRUE;
+
+  char *path = g_find_program_in_path("code");
+  if (path) {
+    g_free(path);
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+/**
  * @brief Creates the "Open with VSCode" menu item for the context menu.
  *
  * This function is the main entry point for the NautilusMenuProvider interface.
  * It is called by Nautilus when building the context menu for selected files.
  *
  * The function creates a single menu item that, when activated, will open all
- * selected files in Visual Studio Code.
+ * selected files in Visual Studio Code. When no VSCode installation is
+ * detected, no menu item is returned so the context menu stays clean.
  *
  * @param provider Pointer to the VSCodeExtension instance (unused)
  * @param files GList of NautilusFileInfo objects representing the selected files
- * @return GList* A list containing the newly created menu item, or NULL if no files selected
+ * @return GList* A list containing the newly created menu item, or NULL if no
+ * files are selected or VSCode is not installed
  */
 static GList *get_file_items(NautilusMenuProvider *provider, GList *files) {
   // Return NULL if no files are selected (empty selection)
   if (!files)
+    return NULL;
+
+  // Hide the menu item when VSCode is not installed (e.g. after uninstall)
+  if (!vscode_installed())
     return NULL;
 
   // Create a new menu item with unique ID, label, and tooltip

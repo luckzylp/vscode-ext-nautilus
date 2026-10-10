@@ -23,6 +23,9 @@ that plugs directly into Nautilus' extension system
 ## Features
 
 - **"Open with VSCode" context-menu entry** for files and folders
+- **Auto-hides when VSCode is uninstalled** — the entry checks on every menu
+  build that VSCode is still installed and stays hidden otherwise, without
+  restarting Nautilus
 - **Multi-selection support** — every selected path is passed to VSCode at once
 - **Fire-and-forget launch** — spawns `code` asynchronously with stdout/stderr
   redirected to `/dev/null`, so the file manager stays clean
@@ -63,12 +66,17 @@ window — a new one by default, since the extension spawns `code` without the
 
 ## How It Works
 
-1. Whenever a context menu is requested, the extension creates a single
-   `NautilusMenuItem` labelled "Open with VSCode" (`vscode::open`).
-2. On activation, each `NautilusFileInfo` URI is converted to a local
+1. Whenever a context menu is requested, the extension checks that VSCode is
+   still installed — by scanning the XDG applications dirs for a desktop
+   entry that launches the `code` CLI (whatever the file is named), plus the
+   hard-coded launcher `/usr/bin/code` and a `code` executable on `PATH`.
+   If none is found (e.g. VSCode was uninstalled), no menu item is created.
+2. Otherwise it creates a single `NautilusMenuItem` labelled
+   "Open with VSCode" (`vscode::open`).
+3. On activation, each `NautilusFileInfo` URI is converted to a local
    filesystem path with `g_filename_from_uri()`; items that cannot be
    converted (e.g. remote shares) are skipped.
-3. The argument vector `/usr/bin/code <path1> <path2> ...` is launched
+4. The argument vector `/usr/bin/code <path1> <path2> ...` is launched
    via `g_spawn_async()` with `G_SPAWN_SEARCH_PATH`, so the `code` binary is
    also resolved from `PATH`. stdout/stderr are redirected to `/dev/null` to
    keep Nautilus free of terminal output.
